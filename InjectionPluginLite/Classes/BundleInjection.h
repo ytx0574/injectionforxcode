@@ -1,5 +1,5 @@
 //
-//  $Id: //depot/injectionforxcode/InjectionPluginLite/Classes/BundleInjection.h#16 $
+//  $Id: //depot/injectionforxcode/InjectionPluginLite/Classes/BundleInjection.h#19 $
 //  Injection
 //
 //  Created by John Holdsworth on 16/01/2012.
@@ -67,7 +67,7 @@ static const char *_inIPAddresses[100] = {INJECTOR_IPADDRS};
 #endif
 
 #ifdef DEBUG
-#define INLog NSLog
+#define INLog( _fmt... ) printf( "> Injection: %s\n", [NSString stringWithFormat:_fmt].UTF8String )
 #else
 #define INLog while(0) NSLog
 #endif
@@ -231,6 +231,7 @@ static NSString *kPreviousInjections = @"INPreviousInjections";
 #ifndef ANDROID
 static NSNetServiceBrowser *browser;
 static NSNetService *service;
+static dispatch_queue_t testQueue;
 
 +(void)netServiceBrowser:(NSNetServiceBrowser *)aBrowser didFindService:(NSNetService *)aService moreComing:(BOOL)more {
     service = aService;
@@ -373,7 +374,7 @@ static NSNetService *service;
     else if ( connect( loaderSocket, (struct sockaddr *)&loaderAddr, sizeof loaderAddr ) >= 0 )
         return loaderSocket;
 
-    INLog( @"%s: Could not connect: %s", INJECTION_APPNAME, strerror( errno ) );
+    INLog( @"%s could not connect: %s", INJECTION_APPNAME, strerror( errno ) );
     close( loaderSocket );
     return 0;
 }
@@ -735,13 +736,15 @@ static time_t bundleBuildTime( NSString *path ) {
 
 #ifndef ANDROID
 + (void)loadBundle {
+    INLog( @"Loading %s", path );
     NSBundle *bundle = [NSBundle bundleWithPath:[NSString stringWithUTF8String:path]];
     if ( !bundle )
         NSLog( @"Could not initalise bundle at \"%s\"", path );
     else
         ;//INLog( @"Injecting Bundle: %s", path );
-    if ( ![bundle load] )
-        NSLog( @"Bundle Load Error" );
+    NSError *err;
+    if ( ![bundle loadAndReturnError:&err] )
+        INLog( @"Bundle Load Error %@", err );
 }
 
 + (void)loadDylib {
@@ -1090,7 +1093,8 @@ struct _in_objc_class { Class meta, supr; void *cache, *vtable; struct _in_objc_
     if ( referencesSection )
         dispatch_async(dispatch_get_main_queue(), ^{
             Class *classReferences = (Class *)(void *)((char *)info.dli_fbase+(uint64_t)referencesSection);
-
+            NSMutableArray *testClasses = [NSMutableArray array];
+            
             for ( unsigned long i=0 ; i<size/sizeof *classReferences ; i++ ) {
                 Class newClass = classReferences[i];
                 NSString *className = NSStringFromClass(newClass);
@@ -1102,20 +1106,46 @@ struct _in_objc_class { Class meta, supr; void *cache, *vtable; struct _in_objc_
                     [newClass class];
 #endif
                     Class oldClass = [self loadedClass:newClass notify:notify];
-                    NSLog( @"Ignore any warning, Swizzled %@ %p -> %p", className,
+                    INLog( @"Ignore any warning, Swizzled %@ %p -> %p", className,
                           INJECTION_BRIDGE(void *)newClass, INJECTION_BRIDGE(void *)oldClass );
                     [injectedClasses addObject:oldClass];
                 }
 
                 if ( [newClass isSubclassOfClass:objc_getClass("XCTestCase")] ) {
-                    id suite0 = [[objc_getClass("XCTestSuite") alloc] initWithName:@"Injected"];
-                    id suite = [objc_getClass("XCTestSuite") testSuiteForTestCaseClass:newClass];
-                    id tr = [objc_getClass("XCTestSuiteRun") testRunWithTest:suite];
-                    [suite0 addTest:suite];
-                    [suite0 performTest:tr];
+                    [testClasses addObject:newClass];
                     if ( [newClass isSubclassOfClass:objc_getClass("QuickSpec")] )
                         [[objc_getClass("_TtC5Quick5World") sharedWorld]
                          setCurrentExampleMetadata:nil];
+                }
+
+            }
+            
+            if (testClasses.count){
+                void (^runTests)() = ^{
+                    for (Class newClass in testClasses) {
+                        id suite0 = [[objc_getClass("XCTestSuite") alloc] initWithName:@"Injected"];
+                        id suite = [objc_getClass("XCTestSuite") testSuiteForTestCaseClass:newClass];
+                        id tr = [objc_getClass("XCTestSuiteRun") testRunWithTest:suite];
+                        [suite0 addTest:suite];
+                        [suite0 performTest:tr];
+                    }
+                };
+
+                if ([UIDevice currentDevice].systemVersion.floatValue < 10.0)
+                    runTests();
+                else {
+                    if (!testQueue){
+                        testQueue = dispatch_queue_create("INTestQueue", NULL);
+                    }
+
+                    dispatch_async(testQueue, ^{
+                        dispatch_suspend(testQueue);
+                        NSTimer *timer = [NSTimer timerWithTimeInterval:0 repeats:NO block:^(NSTimer * _Nonnull timer) {
+                            runTests();
+                            dispatch_resume(testQueue);
+                        }];
+                        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+                    });
                 }
             }
 
